@@ -71,7 +71,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 mod tests {
     use super::*;
     use crate::sampler::AllSampler;
-    use crate::span::{FinishedSpan, Span};
+    use crate::span::{FinishedSpan, RoutingMetadata, Span};
     use crate::tag::{StdTag, Tag, TagValue};
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::thread;
@@ -173,5 +173,81 @@ mod tests {
     fn span_can_be_shared() {
         fn trait_check<T: Send + Sync>() {}
         trait_check::<Span<()>>();
+    }
+
+    #[test]
+    fn routing_inherited_by_children() {
+        let routing = RoutingMetadata {
+            zone_id: 7,
+            account_id: 99,
+            account_tag: "ws".to_string(),
+            destinations: vec!["d1".to_string()],
+            persist: true,
+        };
+
+        let (tracer, mut span_rx) = Tracer::new(AllSampler);
+        {
+            // Routing is set once, at construction, on the root only.
+            let parent = tracer
+                .span("parent")
+                .routing(routing.clone())
+                .start_with_state(());
+            let child = parent.child("child", |s| s.start_with_state(()));
+            let grandchild = child.child("grandchild", |s| s.start_with_state(()));
+
+            drop(grandchild);
+            drop(child);
+            drop(parent);
+        }
+
+        // Every span in the tree carries the same routing, without it being
+        // passed to each child.
+        for expected in ["grandchild", "child", "parent"] {
+            let span = span_rx.try_recv().unwrap();
+            assert_eq!(span.operation_name(), expected);
+
+            let r = span
+                .routing()
+                .unwrap_or_else(|| panic!("{expected} should inherit routing"));
+            assert_eq!(r.zone_id, 7);
+            assert_eq!(r.account_id, 99);
+            assert_eq!(r.account_tag, "ws");
+            assert_eq!(r.destinations, vec!["d1".to_string()]);
+            assert!(r.persist);
+        }
+    }
+
+    #[test]
+    fn routing_last_set_wins() {
+        let (tracer, mut span_rx) = Tracer::new(AllSampler);
+        {
+            // If the builder is called more than once, the last value wins.
+            let span = tracer
+                .span("span")
+                .routing(RoutingMetadata {
+                    zone_id: 1,
+                    account_id: 1,
+                    account_tag: "first".to_string(),
+                    destinations: vec![],
+                    persist: false,
+                })
+                .routing(RoutingMetadata {
+                    zone_id: 2,
+                    account_id: 2,
+                    account_tag: "second".to_string(),
+                    destinations: vec!["d".to_string()],
+                    persist: true,
+                })
+                .start_with_state(());
+            drop(span);
+        }
+
+        let span = span_rx.try_recv().unwrap();
+        let r = span.routing().expect("routing should be set");
+        assert_eq!(r.zone_id, 2);
+        assert_eq!(r.account_id, 2);
+        assert_eq!(r.account_tag, "second");
+        assert_eq!(r.destinations, vec!["d".to_string()]);
+        assert!(r.persist);
     }
 }
