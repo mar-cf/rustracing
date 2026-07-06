@@ -106,26 +106,15 @@ impl<T, F: Fn(&mut Span<T>) + Send + Sync + 'static> From<F> for FinishSpanCallb
     }
 }
 
-/// Routing metadata attached to a span.
-///
-/// Set once at span construction via [`StartSpanOptions::routing`] and inherited
-/// by child spans, then carried into the resulting [`FinishedSpan`], where an
-/// exporter can read it to route the span to the correct destination.
-///
-/// There is no live setter: routing cannot be changed or cleared after a span
-/// has started, so it cannot be accidentally dropped by later span mutations.
-#[derive(Clone, Debug)]
-pub struct RoutingMetadata {
-    /// The zone the traced request belongs to.
-    pub zone_id: u64,
-    /// The account that owns the zone.
-    pub account_id: u64,
-    /// The account tag the traced request belongs to.
-    pub account_tag: String,
-    /// The destinations the trace should be forwarded to.
-    pub destinations: Vec<String>,
-    /// Whether the trace is persisted to the managed (ClickHouse) store.
-    pub persist: bool,
+/// Caller-defined routing attached to a span, inherited by children, and read by
+/// the exporter to route the resulting [`FinishedSpan`].
+pub trait RoutingMetadata: fmt::Debug + Send + Sync {
+    /// Batching key: spans sharing it are exported together. Must differ
+    /// whenever [`encode`](RoutingMetadata::encode) would.
+    fn group_key(&self) -> String;
+
+    /// The value the exporter transmits for this routing.
+    fn encode(&self) -> String;
 }
 
 /// Span.
@@ -387,7 +376,7 @@ struct SpanInner<T> {
     context: SpanContext<T>,
     finish_cb: Option<FinishSpanCallback<T>>,
     span_tx: SharedSpanConsumer<T>,
-    routing: Option<RoutingMetadata>,
+    routing: Option<Arc<dyn RoutingMetadata>>,
 }
 
 /// Finished span.
@@ -400,7 +389,7 @@ pub struct FinishedSpan<T> {
     tags: Vec<Tag>,
     logs: Vec<Log>,
     context: SpanContext<T>,
-    routing: Option<RoutingMetadata>,
+    routing: Option<Arc<dyn RoutingMetadata>>,
 }
 impl<T> FinishedSpan<T> {
     /// Returns the operation name of this span.
@@ -439,8 +428,8 @@ impl<T> FinishedSpan<T> {
     }
 
     /// Returns the routing metadata of this span, if any was set.
-    pub fn routing(&self) -> Option<&RoutingMetadata> {
-        self.routing.as_ref()
+    pub fn routing(&self) -> Option<&dyn RoutingMetadata> {
+        self.routing.as_deref()
     }
 }
 
@@ -635,7 +624,7 @@ pub struct StartSpanOptions<'a, S: 'a, T: 'a> {
     references: Vec<SpanReference<T>>,
     baggage_items: Vec<BaggageItem>,
     finish_cb: Option<FinishSpanCallback<T>>,
-    routing: Option<RoutingMetadata>,
+    routing: Option<Arc<dyn RoutingMetadata>>,
     span_tx: &'a SharedSpanConsumer<T>,
     sampler: &'a S,
 }
@@ -670,7 +659,7 @@ where
     /// exporter to read, and is inherited by child spans (see [`Span::child`]).
     /// This is the only way to set routing — there is no live setter, so routing
     /// cannot be changed or cleared after the span has started.
-    pub fn routing(mut self, routing: RoutingMetadata) -> Self {
+    pub fn routing(mut self, routing: Arc<dyn RoutingMetadata>) -> Self {
         self.routing = Some(routing);
         self
     }

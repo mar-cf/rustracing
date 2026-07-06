@@ -74,8 +74,25 @@ mod tests {
     use crate::span::{FinishedSpan, RoutingMetadata, Span};
     use crate::tag::{StdTag, Tag, TagValue};
     use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[derive(Debug)]
+    struct TestRouting {
+        zone_id: u64,
+        account_id: u64,
+    }
+
+    impl RoutingMetadata for TestRouting {
+        fn group_key(&self) -> String {
+            format!("{}|{}", self.zone_id, self.account_id)
+        }
+
+        fn encode(&self) -> String {
+            format!("zone={};account={}", self.zone_id, self.account_id)
+        }
+    }
 
     #[tokio::test]
     async fn it_works() {
@@ -177,13 +194,12 @@ mod tests {
 
     #[test]
     fn routing_inherited_by_children() {
-        let routing = RoutingMetadata {
+        let routing = Arc::new(TestRouting {
             zone_id: 7,
             account_id: 99,
-            account_tag: "ws".to_string(),
-            destinations: vec!["d1".to_string()],
-            persist: true,
-        };
+        });
+        let expected_group_key = routing.group_key();
+        let expected_encoded = routing.encode();
 
         let (tracer, mut span_rx) = Tracer::new(AllSampler);
         {
@@ -209,45 +225,37 @@ mod tests {
             let r = span
                 .routing()
                 .unwrap_or_else(|| panic!("{expected} should inherit routing"));
-            assert_eq!(r.zone_id, 7);
-            assert_eq!(r.account_id, 99);
-            assert_eq!(r.account_tag, "ws");
-            assert_eq!(r.destinations, vec!["d1".to_string()]);
-            assert!(r.persist);
+            assert_eq!(r.group_key(), expected_group_key);
+            assert_eq!(r.encode(), expected_encoded);
         }
     }
 
     #[test]
     fn routing_last_set_wins() {
+        let second = Arc::new(TestRouting {
+            zone_id: 2,
+            account_id: 2,
+        });
+        let expected_group_key = second.group_key();
+        let expected_encoded = second.encode();
+
         let (tracer, mut span_rx) = Tracer::new(AllSampler);
         {
             // If the builder is called more than once, the last value wins.
             let span = tracer
                 .span("span")
-                .routing(RoutingMetadata {
+                .routing(Arc::new(TestRouting {
                     zone_id: 1,
                     account_id: 1,
-                    account_tag: "first".to_string(),
-                    destinations: vec![],
-                    persist: false,
-                })
-                .routing(RoutingMetadata {
-                    zone_id: 2,
-                    account_id: 2,
-                    account_tag: "second".to_string(),
-                    destinations: vec!["d".to_string()],
-                    persist: true,
-                })
+                }))
+                .routing(second.clone())
                 .start_with_state(());
             drop(span);
         }
 
         let span = span_rx.try_recv().unwrap();
         let r = span.routing().expect("routing should be set");
-        assert_eq!(r.zone_id, 2);
-        assert_eq!(r.account_id, 2);
-        assert_eq!(r.account_tag, "second");
-        assert_eq!(r.destinations, vec!["d".to_string()]);
-        assert!(r.persist);
+        assert_eq!(r.group_key(), expected_group_key);
+        assert_eq!(r.encode(), expected_encoded);
     }
 }
